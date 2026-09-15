@@ -14,8 +14,9 @@ import array
 import network   # controla o Wi-Fi da ESP32
 from machine import Pin, PWM  # Pin = pino digital | PWM = sinal para o servo
 from umqtt.simple import MQTTClient# biblioteca que fala o protocolo MQTT
-
+#-------------------------------
 # CONFIGURACAO -- dos meus dados
+#-------------------------------
 SSID = "quarto_camila123"      # nome da rede Wi-Fi que a ESP32 vai usar
 SENHA = "camila123"            # senha dessa rede
 BROKER = "broker.hivemq.com"   # servidor MQTT publico e gratuito
@@ -40,20 +41,21 @@ _TOPICO_ESP32_B = TOPICO_ESP32.encode()
 
 INTERVALO = 3000        # de quanto em quanto tempo (em ms) a placa publica: 3000 ms = 3 s
 JANELA_PRESENCA = 8000  # por quantos ms, depois de ouvir som, ainda considero "Presente"
-
-# HARDWARE -- SAIDAS (atuadores: rele(liga e deliga o ar) e servo(abre e fecha as janelas))
-
-rele = Pin(26, Pin.OUT)  # liga o modulo rele
+#--------------------------------------------------
+# HARDWARE SAIDAS (atuadores: rele(liga e deliga o ar) e servo(abre e fecha as janelas))
+#---------------------------------------------------
+rele = Pin(26, Pin.OUT)  # LIGA MODULO RALE
 ATIVO_EM_NIVEL_BAIXO = True            
 
-servo = PWM(Pin(25), freq=50)         # GPIO 25 gerando PWM a 50 Hz (padrao de servo)
+servo = PWM(Pin(25), freq=50)         #SERVO-  GPIO 25 gerando PWM a 50 Hz (padrao de servo)
 PULSO_MIN = 0.5                       # largura de pulso (ms) que corresponde a   0 graus
 PULSO_MAX = 2.5                       # largura de pulso (ms) que corresponde a 180 graus
 
 ac_ligado = False       # guarda se o ar-condicionado esta ligado agora
 janela_aberta = False   # guarda se a janela esta aberta agora
-
+#--------------
 #FUNCAO DO AR
+#--------------
 def ac_ligar():
     global ac_ligado                                  
     rele.value(0 if ATIVO_EM_NIVEL_BAIXO else 1)   # manda o nivel que liga o rele
@@ -63,8 +65,9 @@ def ac_desligar():
     global ac_ligado
     rele.value(1 if ATIVO_EM_NIVEL_BAIXO else 0)        # manda o nivel contrario
     ac_ligado = False
-    
+#----------------   
 #FUNÇAO JANELA
+#----------------
 def servo_angulo(graus):
     graus = max(0, min(180, graus)) # trava entre 0 e 180, nunca deixa passar
     largura = PULSO_MIN + (graus / 180) * (PULSO_MAX - PULSO_MIN)
@@ -84,9 +87,11 @@ def janela_fechar():
 ac_desligar()
 janela_fechar()
 
+#----------------------------------------------------
 # HARDWARE -- ENTRADAS (sensores: som e infravermelho)
-# SENSOR DE SOM 
-som = Pin(33, Pin.IN)                                    
+# SENSOR DE SOM
+#--------------------------------------------------
+som = Pin(33, Pin.IN)   #SOM                              
 _ultimo_som = time.ticks_ms() - JANELA_PRESENCA - 1000  
 
 def _som_callback(pin):
@@ -95,9 +100,10 @@ def _som_callback(pin):
     global _ultimo_som
     _ultimo_som = time.ticks_ms()    # so guarda "agora foi a ultima vez que ouvi som"
 som.irq(trigger=Pin.IRQ_RISING, handler=_som_callback)
-
+#--------------------------
 # Receptor infravermelho
-IR_PINO = 34
+#--------------------------
+IR_PINO = 34  #RECPTORA
 _IR_MAX_BITS = 32                   
 _ir_buffer = array.array("i", [0] * _IR_MAX_BITS)  # espaco JA reservado na memoria
 _ir_indice = 0            # em que posicao do buffer estou escrevendo agora
@@ -145,8 +151,9 @@ def ir_decodificar():
     _ir_indice = 0
     return codigo
 temperatura_alvo = 24   # valor inicial da temperatura desejada
-
+#-------------
 # WI-FI
+#-------------
 wlan = network.WLAN(network.STA_IF)   # STA_IF = a placa se conecta a um roteador
 wlan.active(True)                     # liga o radio Wi-Fi
 
