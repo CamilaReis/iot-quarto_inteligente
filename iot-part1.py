@@ -1,255 +1,264 @@
-#ideia do meu projeto eh fazer um quarto inteligente, onde eu possa liga e deligar o meu ar, abrir e fechar as minhas janelas e usando um dector de som para ver se temos alg presente no quarto
+# Um "quarto inteligente" controlado a distancia pelo celular via MQTT:
+# - Sensor de som     -> detecta se tem alguem no ambiente (presenca)
+#- Receptor IR       -> le o controle remoto para ajustar a temperatura
+                           #desejada (botao pra cima aumenta, pra baixo
+                           #diminui)
+#- Rele              -> liga/desliga o ar-condicionado, só por comando MQTT
+#  - Servomotor        -> abre/fecha a janela, só por comando MQTT
 
-import network
-import time
-import json
-from machine import Pin, PWM
-from umqtt.simple import MQTTClient
 
-#CONFIGURACOES DO WI-FI E MQTT
-SSID = "quarto_camila" #nome da minha rede de wife
-SENHA = "camila123" #senha da rede 
-BROKER = "broker.hivemq.com"
-ID_ESP32 = "camila_quarto_01"
 
-# Topicos MQTT
-TOPICO_RELE = b"fei/camila_quarto_01/rele"
-TOPICO_JANELA = b"fei/camila_quarto_01/janela"
-TOPICO_ESP32 = b"fei/camila_quarto_01/esp32"
+# BIBLIOTECAS
+import time    # tempo sem travar o programa (ticks_ms, ticks_us)
+import array                      
+import network   # controla o Wi-Fi da ESP32
+from machine import Pin, PWM  # Pin = pino digital | PWM = sinal para o servo
+from umqtt.simple import MQTTClient# biblioteca que fala o protocolo MQTT
 
-TOPICO_DHT22 = b"fei/camila_quarto_01/dht22"
-TOPICO_SOM = b"fei/camila_quarto_01/som"
-TOPICO_STATUS = b"fei/camila_quarto_01/status"
+# CONFIGURACAO -- dos meus dados
+SSID = "quarto_camila123"      # nome da rede Wi-Fi que a ESP32 vai usar
+SENHA = "camila123"            # senha dessa rede
+BROKER = "broker.hivemq.com"   # servidor MQTT publico e gratuito
+PORTA = 1883                   # porta padrao do MQTT sem criptografia
+MEU_ID = "uniccasilava" # seu identificador unico no broker
+BASE = "/" + MEU_ID  # ex: "/uniccasilava"
 
-# 2. CONFIGURACAO DOS COMPONENTES
+# cada linha abaixo e so BASE + o nome da "grandeza" (o que aquele topico representa)
+TOPICO_PRESENCA = BASE + "/presenca" # sensor de som publica aqui
+TOPICO_TEMP_ALVO = BASE + "/temperatura_alvo" # receptor IR publica aqui
 
-# Rele do ar-condicionado
-rele = Pin(26, Pin.OUT)
+TOPICO_AC_STATUS = BASE + "/ar_condicionado" # a placa publica: ligado/desligado
+TOPICO_AC_CMD = BASE + "/ar_condicionado_cmd" # a placa ESCUTA: Ligar/Desligar
 
-# Servomotor da janela
-servo = PWM(Pin(25), freq=50)
+TOPICO_JANELA_STATUS = BASE + "/janela"  # a placa publica: aberta/fechada
+TOPICO_JANELA_CMD = BASE + "/janela_cmd" # a placa ESCUTA: Abrir/Fechar
+TOPICO_ESP32 = BASE + "/esp32" # comandos gerais da placa
 
-# Sensor de som
-sensor_som = Pin(33, Pin.IN)
+_TOPICO_AC_CMD_B = TOPICO_AC_CMD.encode()
+_TOPICO_JANELA_CMD_B = TOPICO_JANELA_CMD.encode()
+_TOPICO_ESP32_B = TOPICO_ESP32.encode()
 
-# DHT22
-from dht import DHT22
-sensor_dht = DHT22(Pin(32))
+INTERVALO = 3000        # de quanto em quanto tempo (em ms) a placa publica: 3000 ms = 3 s
+JANELA_PRESENCA = 8000  # por quantos ms, depois de ouvir som, ainda considero "Presente"
 
-# Estados dos atuadores
-ar_ligado = False
-janela_aberta = False
+# HARDWARE -- SAIDAS (atuadores: rele(liga e deliga o ar) e servo(abre e fecha as janelas))
 
-# Intervalo de envio dos sensores
-intervalo = 3
+rele = Pin(26, Pin.OUT)  # liga o modulo rele
+ATIVO_EM_NIVEL_BAIXO = True            
 
-# Tempo do ultimo envio
-ultimo_envio = time.ticks_ms()
+servo = PWM(Pin(25), freq=50)         # GPIO 25 gerando PWM a 50 Hz (padrao de servo)
+PULSO_MIN = 0.5                       # largura de pulso (ms) que corresponde a   0 graus
+PULSO_MAX = 2.5                       # largura de pulso (ms) que corresponde a 180 graus
 
-# 3. FUNCAO PARA CONECTAR AO WI-FI
+ac_ligado = False       # guarda se o ar-condicionado esta ligado agora
+janela_aberta = False   # guarda se a janela esta aberta agora
 
-def conectar_wifi(ssid, senha):
+#FUNCAO DO AR
+def ac_ligar():
+    global ac_ligado                                  
+    rele.value(0 if ATIVO_EM_NIVEL_BAIXO else 1)   # manda o nivel que liga o rele
+    ac_ligado = True                               # atualiza o estado guardado
 
-    wlan = network.WLAN(network.STA_IF)
-    wlan.active(True)
+def ac_desligar():
+    global ac_ligado
+    rele.value(1 if ATIVO_EM_NIVEL_BAIXO else 0)        # manda o nivel contrario
+    ac_ligado = False
+    
+#FUNÇAO JANELA
+def servo_angulo(graus):
+    graus = max(0, min(180, graus)) # trava entre 0 e 180, nunca deixa passar
+    largura = PULSO_MIN + (graus / 180) * (PULSO_MAX - PULSO_MIN)
+    # duty_u16 espera um numero de 0 a 65535 representando os 20 ms do ciclo do PWM
+    servo.duty_u16(int(largura / 20 * 65535))
 
-    if not wlan.isconnected():
-
-        print("Conectando ao Wi-Fi...")
-        wlan.connect(ssid, senha)
-        tentativas = 0
-        while not wlan.isconnected() and tentativas < 20:
-
-            time.sleep(0.5)
-            tentativas += 1
-
-    if wlan.isconnected():
-        print("Wi-Fi conectado!")
-        print("Endereco IP:", wlan.ifconfig()[0])
-    else:
-        print("Falha ao conectar ao Wi-Fi")
-    return wlan
-
-# 4. FUNCAO PARA CONECTAR AO MQTT
-
-def conectar_mqtt():
-
-    cliente = MQTTClient(ID_ESP32, BROKER)
-    cliente.set_callback(callback_mensagem)
-    cliente.connect()
-    # Assina os topicos de comando
-    cliente.subscribe(TOPICO_RELE)
-    cliente.subscribe(TOPICO_JANELA)
-    cliente.subscribe(TOPICO_ESP32)
-    print("Conectado ao broker MQTT!")
-    return cliente
-
-# 5. FUNCAO PARA CONTROLAR O RELE (meu ar)
-
-def controlar_rele(comando):
-    global ar_ligado
-    if comando == b"LIGAR":
-        rele.value(1)
-        ar_ligado = True
-        print("Ar-condicionado ligado")
-    elif comando == b"DESLIGAR":
-        rele.value(0)
-        ar_ligado = False
-        print("Ar-condicionado desligado")
-
-# 6. FUNCAO PARA CONTROLAR O SERVO (minha janela)
-
-def controlar_janela(comando):
+def janela_abrir():
     global janela_aberta
-    if comando == b"ABRIR":
-        servo.duty_u16(4915)
-        janela_aberta = True
-        print("Janela aberta")
-    elif comando == b"FECHAR":
-        servo.duty_u16(1638)
-        janela_aberta = False
-        print("Janela fechada")
+    servo_angulo(90)          # gira o servo pra posicao de "aberta"
+    janela_aberta = True
 
-# 7. FUNCAO DE CALLBACK DO MQTT
+def janela_fechar():
+    global janela_aberta
+    servo_angulo(0)           # gira o servo pra posicao de "fechada"
+    janela_aberta = False
 
-def callback_mensagem(topico, mensagem):
+ac_desligar()
+janela_fechar()
 
-    global intervalo
+# HARDWARE -- ENTRADAS (sensores: som e infravermelho)
+# SENSOR DE SOM 
+som = Pin(33, Pin.IN)                                    
+_ultimo_som = time.ticks_ms() - JANELA_PRESENCA - 1000  
 
-    print("Topico recebido:", topico)
-    print("Mensagem recebida:", mensagem)
+def _som_callback(pin):
+    # essa funcao roda AUTOMATICAMENTE, na hora, quando o pino 33 sobe pra
+    # 3.3V (ou seja, quando o sensor detecta um som). 
+    global _ultimo_som
+    _ultimo_som = time.ticks_ms()    # so guarda "agora foi a ultima vez que ouvi som"
+som.irq(trigger=Pin.IRQ_RISING, handler=_som_callback)
 
-    if topico == TOPICO_RELE:
+# Receptor infravermelho
+IR_PINO = 34
+_IR_MAX_BITS = 32                   
+_ir_buffer = array.array("i", [0] * _IR_MAX_BITS)  # espaco JA reservado na memoria
+_ir_indice = 0            # em que posicao do buffer estou escrevendo agora
+_ir_marca = time.ticks_us()  # instante (em microssegundos) da ultima borda vista
+_ir_pronto = False        # fica True quando um codigo completo (32 bits) chegou
 
-        controlar_rele(mensagem)
+DEBUG_IR = True   
+IR_LIMIAR_US = 1500   # acima disso (microssegundos) e bit 1, abaixo e bit 0
 
-    elif topico == TOPICO_JANELA:
+IR_CODIGO_MAIS = 0    # botao que vai AUMENTAR a temperatura desejada
+IR_CODIGO_MENOS = 0   # botao que vai DIMINUIR a temperatura desejada
 
-        controlar_janela(mensagem)
+def _ir_callback(pin):
+    # roda a cada borda de DESCIDA no pino do receptor IR
+    global _ir_indice, _ir_marca, _ir_pronto
+    agora = time.ticks_us()                       # tempo atual, em microssegundos
+    intervalo = time.ticks_diff(agora, _ir_marca)  # quanto tempo desde a ultima borda
+    _ir_marca = agora                              # guarda pra proxima chamada
 
-    elif topico == TOPICO_ESP32:
+    if intervalo > 10000:
+        _ir_indice = 0
+        _ir_pronto = False
+        return
 
-        if mensagem == b"ATIVAR":
+    if _ir_indice < _IR_MAX_BITS:
+        _ir_buffer[_ir_indice] = intervalo   # guarda esse intervalo no buffer
+        _ir_indice += 1                      # avanca pra proxima posicao
+        if _ir_indice == _IR_MAX_BITS:
+            _ir_pronto = True                # buffer completo -> pode decodificar
 
-            intervalo = 3
-            print("Envio dos sensores ativado")
+ir = Pin(IR_PINO, Pin.IN)                                  # GPIO 34 como entrada
+ir.irq(trigger=Pin.IRQ_FALLING, handler=_ir_callback)      # dispara em toda borda de descida
 
-        elif mensagem == b"DESATIVAR":
+def ir_decodificar():
+    """Le o que esta no buffer e transforma em um numero inteiro unico.
+    So chame isso quando _ir_pronto for True."""
+    global _ir_indice, _ir_pronto
 
-            intervalo = 0
-            print("Envio dos sensores desativado")
+    codigo = 0
+    for i in range(_IR_MAX_BITS):
+        bit = 1 if _ir_buffer[i] > IR_LIMIAR_US else 0   # decide se e bit 0 ou 1
+        codigo = (codigo << 1) | bit                     # empilha o bit no numero final
 
-        elif mensagem.startswith(b"ATUALIZAR:"):
+    _ir_pronto = False   #Esta esperando o proximo
+    _ir_indice = 0
+    return codigo
+temperatura_alvo = 24   # valor inicial da temperatura desejada
 
+# WI-FI
+wlan = network.WLAN(network.STA_IF)   # STA_IF = a placa se conecta a um roteador
+wlan.active(True)                     # liga o radio Wi-Fi
+
+if not wlan.isconnected():
+    wlan.connect(SSID, SENHA)    # tenta conectar com meus dados
+    inicio = time.ticks_ms()
+    while not wlan.isconnected():
+        if time.ticks_diff(time.ticks_ms(), inicio) > 15000:
+            # passou de 15 segundos tentando e nao conectou -> desiste com erro
+            raise RuntimeError("Wi-Fi nao conectou")
+        time.sleep(0.5)   
+print("Wi-Fi ok. IP:", wlan.ifconfig()[0])   # mostra o IP que a ESP32 recebeu
+
+# CALLBACK MQTT -- o que fazer quando chega uma mensagem
+ativo = True   # se False, a placa para de PUBLICAR (mas continua escutando comandos)
+def ao_receber(topico, mensagem):
+    # essa funcao e chamada AUTOMATICAMENTE pela biblioteca MQTT sempre que
+    # chega uma mensagem em qualquer topico que a placa assinou.
+    global ativo, INTERVALO
+    print("Recebido:", topico, mensagem)   # so pra acompanhar no Shell
+    if topico == _TOPICO_AC_CMD_B:
+        # mensagem chegou no topico de comando do ar-condicionado
+        if mensagem == b"Ligar":
+            ac_ligar()
+        elif mensagem == b"Desligar":
+            ac_desligar()
+        else:
+            print("Comando de ar-condicionado desconhecido, ignorado.")
+
+    elif topico == _TOPICO_JANELA_CMD_B:
+        # mensagem chegou no topico de comando da janela
+        if mensagem == b"Abrir":
+            janela_abrir()
+        elif mensagem == b"Fechar":
+            janela_fechar()
+        else:
+            print("Comando de janela desconhecido, ignorado.")
+
+    elif topico == _TOPICO_ESP32_B:
+        # mensagem chegou no topico de comandos gerais da placa
+        if mensagem == b"Ativar":
+            ativo = True
+        elif mensagem == b"Desativar":
+            ativo = False
+        elif mensagem.startswith(b"Atualizar:"):
+            # espera algo como b"Atualizar:5"
             try:
+                # "Atualizar:" tem 10 letras -> mensagem[10:] pega so o que vem depois
+                segundos = int(mensagem[10:].decode())   # bytes -> texto -> numero
+                segundos = max(2, min(10, segundos))     # trava entre 2 e 10 segundos
+                INTERVALO = segundos * 1000              # guarda em milissegundos
+                print("Intervalo atualizado para", segundos, "s")
+            except ValueError:
+                # chegou algo que nao e um numero valido -- ignora sem quebrar o programa
+                print("Valor de Atualizar invalido, ignorado.")
+        else:
+            print("Comando de ESP32 desconhecido, ignorado.")
 
-                novo_intervalo = int(mensagem.split(b":")[1])
+    else:
+        print("Topico desconhecido, ignorado.")
 
-                if 2 <= novo_intervalo <= 10:
+#CONEXAO AO BROKER
+client = MQTTClient(MEU_ID, BROKER, port=PORTA)   # cria o cliente MQTT
+client.set_callback(ao_receber)                   # 1) registra quem trata as mensagens
+client.connect()                                  # 2) conecta no broker
+client.subscribe(TOPICO_AC_CMD)                   # 3) passa a escutar este topico...
+client.subscribe(TOPICO_JANELA_CMD)               #    ...e este...
+client.subscribe(TOPICO_ESP32)                    #    ...e este
+# a ORDEM importa: registrar o callback ANTES de assinar. Se assinar antes,
+# a mensagem chega mas nada acontece (bug silencioso).
 
-                    intervalo = novo_intervalo
+print("Conectado ao broker", BROKER)
+print("Escutando comandos em:")
+print(" ", TOPICO_AC_CMD)
+print(" ", TOPICO_JANELA_CMD)
+print(" ", TOPICO_ESP32)
 
-                    print("Novo intervalo:", intervalo)
-
-                else:
-
-                    print("Intervalo deve ser entre 2 e 10 segundos")
-
-            except:
-
-                print("Formato invalido")
-
-
-# =====================================================
-# 8. FUNCAO PARA ENVIAR DADOS DOS SENSORES
-# =====================================================
-
-def publicar_sensores():
-
-    # Leitura do DHT22
-    sensor_dht.measure()
-
-    temperatura = sensor_dht.temperature()
-    umidade = sensor_dht.humidity()
-
-    # Leitura do sensor de som
-    som_detectado = sensor_som.value()
-
-    # Envia temperatura e umidade
-    dados_dht = {
-        "temperatura": temperatura,
-        "umidade": umidade
-    }
-
-    client.publish(
-        TOPICO_DHT22,
-        json.dumps(dados_dht)
-    )
-
-    # Envia dados do sensor de som
-    dados_som = {
-        "som": som_detectado
-    }
-
-    client.publish(
-        TOPICO_SOM,
-        json.dumps(dados_som)
-    )
-
-    # Envia o estado do ar e da janela
-    dados_status = {
-        "ar": "LIGADO" if ar_ligado else "DESLIGADO",
-        "janela": "ABERTA" if janela_aberta else "FECHADA"
-    }
-
-    client.publish(
-        TOPICO_STATUS,
-        json.dumps(dados_status)
-    )
-
-    print("Sensores publicados:", dados_dht)
-    print("Som:", som_detectado)
-    print("Status:", dados_status)
-
-
-# =====================================================
-# 9. PROGRAMA PRINCIPAL
-# =====================================================
-
-wlan = conectar_wifi(SSID, SENHA)
-
-if wlan.isconnected():
-
-    client = conectar_mqtt()
-
-    print("Quarto inteligente iniciado!")
-
+# LOOP PRINCIPAL -- nada aqui pode travar
+ultimo_envio = time.ticks_ms()   # guarda quando foi a ultima publicacao
+try:
     while True:
+        client.check_msg()   # verifica mensagem SEM travar
+        if _ir_pronto:
+            codigo = ir_decodificar()
+            if DEBUG_IR:
+                print("Codigo IR recebido:", hex(codigo))   # pra descobrir os codigos
+            if IR_CODIGO_MAIS and codigo == IR_CODIGO_MAIS:
+                temperatura_alvo = min(30, temperatura_alvo + 1)   # nunca passa de 30
+                print("Temperatura alvo:", temperatura_alvo)
+            elif IR_CODIGO_MENOS and codigo == IR_CODIGO_MENOS:
+                temperatura_alvo = max(16, temperatura_alvo - 1)   # nunca abaixo de 16
+                print("Temperatura alvo:", temperatura_alvo)
 
-        try:
+        # ja passou o tempo de publicar de novo? ---
+        agora = time.ticks_ms()
+        if ativo and time.ticks_diff(agora, ultimo_envio) >= INTERVALO:
+            ultimo_envio = agora   # reinicia a contagem a partir de agora
 
-            # Verifica se chegaram comandos MQTT
-            client.check_msg()
+            # True se ouviu som ha menos de JANELA_PRESENCA ms
+            presente = time.ticks_diff(agora, _ultimo_som) < JANELA_PRESENCA
 
-            # Envia os sensores no intervalo definido
-            if intervalo > 0:
+            client.publish(TOPICO_PRESENCA, "Presente" if presente else "Vazio")
+            client.publish(TOPICO_TEMP_ALVO, str(temperatura_alvo))   # numero -> texto
+            client.publish(TOPICO_AC_STATUS, "Ligado" if ac_ligado else "Desligado")
+            client.publish(TOPICO_JANELA_STATUS, "Aberta" if janela_aberta else "Fechada")
 
-                agora = time.ticks_ms()
-
-                if time.ticks_diff(agora, ultimo_envio) >= intervalo * 1000:
-
-                    publicar_sensores()
-
-                    ultimo_envio = agora
-
-            time.sleep(0.1)
-
-        except Exception as erro:
-
-            print("Erro:", erro)
-
-            time.sleep(3)
-
-else:
-
-    print("Nao foi possivel iniciar o projeto.")
+            print("Publicado -- presenca:", presente,
+                  "| temp alvo:", temperatura_alvo,
+                  "| ac:", ac_ligado,
+                  "| janela:", janela_aberta)
+finally:
+    # roda sempre que o programa para (erro ou Ctrl+C), garantindo que a
+    # conexao com o broker fecha direito
+    client.disconnect()
+    print("Desconectado do broker.")
