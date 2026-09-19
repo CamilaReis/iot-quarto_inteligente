@@ -1,0 +1,270 @@
+# ==========================================
+# CAMADA 1: CONFIGURAÇÕES E CONSTANTES
+# ==========================================
+import time
+import array
+import network
+from machine import Pin, PWM
+from umqtt.simple import MQTTClient
+
+# Wi-Fi e MQTT
+SSID = "CCM130"
+SENHA = "fei@iot2026"
+BROKER = "broker.hivemq.com"
+PORTA = 1883
+MEU_ID = "uniccasilava"
+BASE = "/" + MEU_ID
+
+# Tópicos MQTT
+TOPICO_PRESENCA = BASE + "/presenca"
+TOPICO_TEMP_ALVO = BASE + "/temperatura_alvo"
+TOPICO_AC_STATUS = BASE + "/ar_condicionado"
+TOPICO_AC_CMD = BASE + "/ar_condicionado_cmd"
+TOPICO_JANELA_STATUS = BASE + "/janela"
+TOPICO_JANELA_CMD = BASE + "/janela_cmd"
+TOPICO_ESP32 = BASE + "/esp32"
+
+_TOPICO_AC_CMD_B = TOPICO_AC_CMD.encode()
+_TOPICO_JANELA_CMD_B = TOPICO_JANELA_CMD.encode()
+_TOPICO_ESP32_B = TOPICO_ESP32.encode()
+
+# Parâmetros de Temporização
+INTERVALO_PUBLICACAO = 3000  # ms
+JANELA_PRESENCA = 8000       # ms
+
+# ==========================================
+# CAMADA 2: HARDWARE E ATUADORES
+# ==========================================
+# Configuração de Pinos
+RELE_PIN = 26
+SOM_PIN = 34
+IR_PIN = 35
+SERVO_PIN = 25
+
+rele = Pin(RELE_PIN, Pin.OUT)
+ATIVO_EM_NIVEL_BAIXO = True
+
+servo = PWM(Pin(SERVO_PIN), freq=50)
+PULSO_MIN = 0.5
+PULSO_MAX = 2.5
+
+# Variáveis de Estado do Sistema
+ac_ligado = False
+janela_aberta = False
+temperatura_alvo = 24
+sistema_ativo = True
+
+def controlar_ar(ligar):
+    global ac_ligado
+    if ligar:
+        rele.value(0 if ATIVO_EM_NIVEL_BAIXO else 1)
+        ac_ligado = True
+    else:
+        rele.value(1 if ATIVO_EM_NIVEL_BAIXO else 0)
+        ac_ligado = False
+
+def mover_servo(graus):
+    graus = max(0, min(180, graus))
+    largura = PULSO_MIN + (graus / 180) * (PULSO_MAX - PULSO_MIN)
+    servo.duty_u16(int(largura / 20 * 65535))
+
+def controlar_janela(abrir):
+    global janela_aberta
+    if abrir:
+        mover_servo(90)
+        janela_aberta = True
+    else:
+        mover_servo(0)
+        janela_aberta = False
+
+# Estado inicial seguro
+controlar_ar(False)
+controlar_janela(False)
+
+# ==========================================
+# CAMADA 3: SENSORES (ISR Seguras)
+# ==========================================
+# Sensor de Som
+som = Pin(SOM_PIN, Pin.IN)
+_ultimo_som = time.ticks_ms() - JANELA_PRESENCA - 1000
+som_detectado_flag = False
+
+def _som_callback(pin):
+    global _ultimo_som, som_detectado_flag
+    _ultimo_som = time.ticks_ms()
+    som_detectado_flag = True
+
+som.irq(trigger=Pin.IRQ_RISING, handler=_som_callback)
+
+# ==========================================
+# CAMADA 3: SENSORES (ISR Seguras & IR Otimizado)
+# ==========================================
+# Sensor de Som
+som = Pin(SOM_PIN, Pin.IN)
+_ultimo_som = time.ticks_ms() - JANELA_PRESENCA - 1000
+som_detectado_flag = False
+
+def _som_callback(pin):
+    global _ultimo_som, som_detectado_flag
+    _ultimo_som = time.ticks_ms()
+    som_detectado_flag = True
+
+som.irq(trigger=Pin.IRQ_RISING, handler=_som_callback)
+
+# Receptor IR - Abordagem com filtro de ruído e tolerância
+_IR_MAX_BITS = 32
+_ir_buffer = array.array("i", [0] * _IR_MAX_BITS)
+_ir_indice = 0
+_ir_marca = time.ticks_us()
+_ir_pronto = False
+IR_LIMIAR_US = 1400  # Ajustado para o padrão NEC
+
+# DEFINA AQUI OS CÓDIGOS CORRETOS APÓS O TESTE COM O FILTRO
+IR_CODIGO_AUMENTAR = 0xff611f  # Exemplo baseado no seu log (ou coloque em decimal)
+IR_CODIGO_DIMINUIR = 3221236394  # Exemplo baseado no seu log
+
+def _ir_callback(pin):
+    global _ir_indice, _ir_marca, _ir_pronto
+    agora = time.ticks_us()
+    intervalo = time.ticks_diff(agora, _ir_marca)
+    _ir_marca = agora
+
+    # Ignora ruídos muito curtos (< 200us) ou pausas longas de sincronismo
+    if intervalo < 200:
+        return
+
+    if intervalo > 14000:  # Pulso de start do protocolo NEC
+        _ir_indice = 0
+        _ir_pronto = False
+        return
+
+    if _ir_indice < _IR_MAX_BITS:
+        _ir_buffer[_ir_indice] = intervalo
+        _ir_indice += 1
+        if _ir_indice >= _IR_MAX_BITS:
+            _ir_pronto = True
+
+ir = Pin(IR_PIN, Pin.IN)
+ir.irq(trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING, handler=_ir_callback)
+
+def decodificar_ir():
+    global _ir_indice, _ir_pronto
+    codigo = 0
+    # Processa apenas os bits de dados (ignorando o cabeçalho inicial)
+    for i in range(min(32, _ir_indice)):
+        bit = 1 if _ir_buffer[i] > IR_LIMIAR_US else 0
+        codigo = (codigo << 1) | bit
+    _ir_pronto = False
+    _ir_indice = 0
+    return codigo
+
+# ==========================================
+# CAMADA 4: CONECTIVIDADE (Wi-Fi & MQTT)
+# ==========================================
+def conectar_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("Conectando ao Wi-Fi...")
+        wlan.connect(SSID, SENHA)
+        inicio = time.ticks_ms()
+        while not wlan.isconnected():
+            if time.ticks_diff(time.ticks_ms(), inicio) > 15000:
+                raise RuntimeError("Falha crítica: Wi-Fi não conectou.")
+            time.sleep(0.5)
+    print("Wi-Fi conectado. IP:", wlan.ifconfig()[0])
+
+def ao_receber_mensagem(topico, mensagem):
+    global sistema_ativo, INTERVALO_PUBLICACAO
+    print(f"MQTT [RX] -> Tópico: {topico} | Mensagem: {mensagem}")
+    
+    if topico == _TOPICO_AC_CMD_B:
+        if mensagem == b"Ligar": controlar_ar(True)
+        elif mensagem == b"Desligar": controlar_ar(False)
+        
+    elif topico == _TOPICO_JANELA_CMD_B:
+        if mensagem == b"Abrir": controlar_janela(True)
+        elif mensagem == b"Fechar": controlar_janela(False)
+        
+    elif topico == _TOPICO_ESP32_B:
+        if mensagem == b"Ativar": sistema_ativo = True
+        elif mensagem == b"Desativar": sistema_ativo = False
+        elif mensagem.startswith(b"Atualizar:"):
+            try:
+                segundos = int(mensagem[10:].decode())
+                INTERVALO_PUBLICACAO = max(2, min(10, segundos)) * 1000
+            except ValueError:
+                pass
+
+def configurar_mqtt():
+    client = MQTTClient(MEU_ID, BROKER, port=PORTA)
+    client.set_callback(ao_receber_mensagem)
+    client.connect()
+    client.subscribe(TOPICO_AC_CMD)
+    client.subscribe(TOPICO_JANELA_CMD)
+    client.subscribe(TOPICO_ESP32)
+    return client
+
+# ==========================================
+# CAMADA 5: ORQUESTRAÇÃO E LOOP PRINCIPAL
+# ==========================================
+conectar_wifi()
+client = configurar_mqtt()
+print("Sistema IoT inicializado com sucesso.")
+
+ultimo_envio = time.ticks_ms()
+
+try:
+    while True:
+        # 1. Processamento de interrupções de som pendentes
+        if som_detectado_flag:
+            som_detectado_flag = False
+            print("Evento: Som detectado no ambiente.")
+
+        # 2. Gerenciamento de mensagens MQTT com reconexão resiliente
+        try:
+            client.check_msg()
+        except OSError:
+            print("Conexão MQTT perdida. Tentando reconectar...")
+            try:
+                client.connect()
+                client.subscribe(TOPICO_AC_CMD)
+                client.subscribe(TOPICO_JANELA_CMD)
+                client.subscribe(TOPICO_ESP32)
+            except Exception:
+                time.sleep(2)
+
+        # 3. Processamento de comandos Infravermelho
+        if _ir_pronto:
+            codigo = decodificar_ir()
+            print(f"[IR] Código recebido -> Decimal: {codigo} | Hex: {hex(codigo)}")
+            
+            if codigo == IR_CODIGO_AUMENTAR:
+                temperatura_alvo = min(30, temperatura_alvo + 1)
+                print(f"-> Temperatura aumentada para: {temperatura_alvo}°C")
+            elif codigo == IR_CODIGO_DIMINUIR:
+                temperatura_alvo = max(16, temperatura_alvo - 1)
+                print(f"-> Temperatura reduzida para: {temperatura_alvo}°C")
+
+        # 4. Publicação periódica de telemetria
+        agora = time.ticks_ms()
+        if sistema_ativo and time.ticks_diff(agora, ultimo_envio) >= INTERVALO_PUBLICACAO:
+            ultimo_envio = agora
+            presente = time.ticks_diff(agora, _ultimo_som) < JANELA_PRESENCA
+
+            try:
+                client.publish(TOPICO_PRESENCA, "Presente" if presente else "Vazio")
+                client.publish(TOPICO_TEMP_ALVO, str(temperatura_alvo))
+                client.publish(TOPICO_AC_STATUS, "Ligado" if ac_ligado else "Desligado")
+                client.publish(TOPICO_JANELA_STATUS, "Aberta" if janela_aberta else "Fechada")
+                print(f"Publicado -> Presença: {presente} | Temp: {temperatura_alvo} | Ar: {ac_ligado} | Janela: {janela_aberta}")
+            except OSError:
+                pass  # Ignora falhas pontuais de envio para não travar o loop
+
+        time.sleep(0.01)  # Folga para o Watchdog da ESP32
+
+finally:
+    client.disconnect()
+    print("Aplicação encerrada.")
+    
+#novo cod
